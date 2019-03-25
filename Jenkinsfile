@@ -1,76 +1,41 @@
-def CONTAINER_NAME="people-api-pipeline"
-def CONTAINER_TAG="latest"
-def CONTAINER_DB_NAME="people-api-db-pipeline"
-def CONTAINER_DB_TAG="latest"
-def OPENSHIFT_PROJECT_NAME="people-api-pipeline"
-def OPENSHIFT_IP="docker-registry-default.apps.192.168.1.54.nip.io"
-
-node {
-
-    stage('Checkout') {
-        checkout scm
+pipeline {
+  agent none
+  stages {
+    stage('Build') {
+      agent { label 'dotnetcore21' }
+      steps {
+        sh "dotnet build"
+      }
     }
-
-    stage("Compile Source"){
-        try {
-            bat "\"C:\\Program Files\\dotnet\\dotnet\" restore"
-            //bat "\"C:\\Program Files\\dotnet\\dotnet\" sonarscanner begin /k:\"peopleapi\" /d:sonar.login=\"1d62160d545c0bd72ec48737ba46219a9d0ea4bb\" /d:sonar.host.url=\"http://localhost:9000\""
-            bat "\"C:\\Program Files\\dotnet\\dotnet\" build"
-            //bat "\"C:\\Program Files\\dotnet\\dotnet\" sonarscanner end /d:sonar.login=\"1d62160d545c0bd72ec48737ba46219a9d0ea4bb\""
-        } catch(error){
-            echo "The .NET Core 2.x compile failed with ${error}"
+    stage('Build Image') {
+      agent { label 'base' }
+      steps {
+        script {
+          openshift.withCluster() {
+            openshift.withProject("peopleapi") {
+              openshift.selector("bc", "peopleapi-bc").startBuild("--wait=true")
+            }
+          }
         }
+      }
     }
-
-    stage("Image Prune"){
-        imagePrune(CONTAINER_NAME)
-        imagePrune(CONTAINER_DB_NAME)
-    }
-
-    stage('DB Image Build'){
-        imageBuild(CONTAINER_DB_NAME, CONTAINER_DB_TAG, "database\\")
-    }
-
-    stage('Application Image Build'){
-        imageBuild(CONTAINER_NAME, CONTAINER_TAG, ".")
-    }
-
-    stage('Aqua MicroScanner for DB Image'){
-        aquaMicroscanner imageName: CONTAINER_DB_NAME, notCompliesCmd: 'exit 1', onDisallowed: 'fail'
-    }
-
-    stage('Aqua MicroScanner for App Image'){
-        aquaMicroscanner imageName: CONTAINER_NAME, notCompliesCmd: 'exit 1', onDisallowed: 'fail'
-    }
-    
-    stage('Push DB to OpenShift Registry'){
-        withCredentials([usernamePassword(credentialsId: 'openshift-docker-registry-account', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-            pushToImage(OPENSHIFT_IP,OPENSHIFT_PROJECT_NAME, CONTAINER_DB_NAME, CONTAINER_DB_TAG, USERNAME, PASSWORD)
+    stage('Scan Codebase') {
+      agent { label 'sonar-dotnet' }
+      steps {
+        withSonarQubeEnv('SonarQube-Server') {
+          sh "dotnet sonarscanner begin /k:peopleapi /d:sonar.host.url=$SONAR_HOST_URL /d:sonar.login=$SONAR_AUTH_TOKEN"
+          sh "dotnet build"
+          sh "dotnet sonarscanner end /d:sonar.login=$SONAR_AUTH_TOKEN"
         }
+      }
     }
-
-    stage('Push App to OpenShift Registry'){
-        withCredentials([usernamePassword(credentialsId: 'openshift-docker-registry-account', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-            pushToImage(OPENSHIFT_IP,OPENSHIFT_PROJECT_NAME, CONTAINER_NAME, CONTAINER_TAG, USERNAME, PASSWORD)
-        }
+    /*  You may need a docker-in-docker to run this on a Jenkins slave agent and do not like doing that */
+    /*
+    stage('Microscanner security scan'){
+      steps {
+        aquaMicroscanner imageName: 'peopleapi/peopleapi:latest', notCompliesCmd: 'exit 1', onDisallowed: 'fail', outputFormat: 'html'
+      }
     }
-}
-
-def imagePrune(containerName){
-    try {
-        bat "\"C:\\Program Files\\Docker\\Docker\\Resources\\bin\\docker\" image prune -f"
-        bat "\"C:\\Program Files\\Docker\\Docker\\Resources\\bin\\docker\" stop $containerName"
-    } catch(error){}
-}
-
-def imageBuild(containerName, tag, pathToDockerfile){
-    bat "\"C:\\Program Files\\Docker\\Docker\\Resources\\bin\\docker\" build -t $containerName:$tag --pull $pathToDockerfile"
-    echo "Image build complete"
-}
-
-def pushToImage(openshiftIP, projectName, containerName, tag, dockerUser, dockerPassword){
-    bat "\"C:\\Program Files\\Docker\\Docker\\Resources\\bin\\docker\" login -u $dockerUser -p $dockerPassword $openshiftIP"
-    bat "\"C:\\Program Files\\Docker\\Docker\\Resources\\bin\\docker\" tag $containerName:$tag $openshiftIP/$projectName/$containerName:$tag"
-    bat "\"C:\\Program Files\\Docker\\Docker\\Resources\\bin\\docker\" push $openshiftIP/$projectName/$containerName:$tag"
-    echo "Image push complete to OpenShift"
+    */
+  }
 }

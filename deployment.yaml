@@ -15,6 +15,10 @@ objects:
     metadata:
       name: "peopleapi"
   - apiVersion: v1
+    kind: "ImageStream"
+    metadata:
+      name: "peopleapidb"
+  - apiVersion: v1
     kind: "BuildConfig"
     metadata:
       name: "peopleapi-bc"
@@ -24,6 +28,7 @@ objects:
         app: peopleapi
       namespace: peopleapi
     spec:
+      completionDeadlineSeconds: 3600
       env:
         - name: "GIT_SSL_NO_VERIFY"
           value: "true"
@@ -34,24 +39,8 @@ objects:
           uri: ${CONSUMER_GIT_URL}
         contextDir: "/"
       strategy:
-        sourceStrategy:
-          env:
-            - name: DOTNET_STARTUP_PROJECT
-            - name: DOTNET_SDK_VERSION
-            - name: DOTNET_ASSEMBLY_NAME
-            - name: DOTNET_NPM_TOOLS
-            - name: DOTNET_TEST_PROJECTS
-            - name: DOTNET_CONFIGURATION
-              value: Debug
-            - name: DOTNET_RESTORE_SOURCES
-            - name: DOTNET_TOOLS
-            - name: DOTNET_RM_SRC
-              value: 'true'
-          from:
-            kind: ImageStreamTag
-            name: 'dotnet:2.1'
-            namespace: openshift
-        type: Source
+        dockerStrategy:
+          dockerfilePath: Dockerfile
       output:
         to:
           kind: "ImageStreamTag"
@@ -59,8 +48,36 @@ objects:
   - apiVersion: v1
     kind: "BuildConfig"
     metadata:
+      name: "peopleapidb-bc"
+      annotations:
+        description: "Defines how to build the People API database."
+      labels:
+        app: peopleapidb
+      namespace: peopleapi
+    spec:
+      completionDeadlineSeconds: 3600
+      env:
+        - name: "GIT_SSL_NO_VERIFY"
+          value: "true"
+      source:
+        type: "Git"
+        git:
+          ref: ${CONSUMER_GIT_BRANCH}
+          uri: ${CONSUMER_GIT_URL}
+        contextDir: "database"
+      strategy:
+        dockerStrategy:
+          dockerfilePath: Dockerfile
+      output:
+        to:
+          kind: "ImageStreamTag"
+          name: "peopleapidb:latest"
+  - apiVersion: v1
+    kind: "BuildConfig"
+    metadata:
       name: "peopleapi-bc-pipeline"
     spec:
+      completionDeadlineSeconds: 3600
       source:
         git:
           ref: ${CONSUMER_GIT_BRANCH}
@@ -84,6 +101,19 @@ objects:
       selector:
         name: "peopleapi"
   - apiVersion: v1
+    kind: "Service"
+    metadata:
+      name: "peopleapidb-svc"
+      annotations:
+        description: "Exposes the application database"
+    spec:
+      ports:
+        - name: "peopleapidb"
+          port: 1433
+          targetPort: 1433
+      selector:
+        name: "peopleapidb"
+  - apiVersion: v1
     kind: Route
     metadata:
       annotations:
@@ -93,7 +123,6 @@ objects:
       name: peopleapi
       namespace: peopleapi
     spec:
-      host: api-peopleapi.192.168.99.101.nip.io
       to:
         kind: Service
         name: peopleapi-svc
@@ -133,12 +162,20 @@ objects:
                   value: Development
                 - name: ASPNETCORE_URLS
                   value: 'http://*:8080'
+                - name: peopleapicontext
+                  value: ${PEOPLEAPI_CONN_STRING}
               image: 'peopleapi/peopleapi:latest'
               imagePullPolicy: IfNotPresent
               ports:
                 - containerPort: 8080
                   protocol: TCP
-              resources: {}
+              resources: 
+                limits:
+                  cpu: 750m
+                  memory: 1Gi
+                requests:
+                  cpu: 250m
+                  memory: 350Mi
               terminationMessagePath: /dev/termination-log
               terminationMessagePolicy: File
           dnsPolicy: ClusterFirst
@@ -157,6 +194,199 @@ objects:
           from:
             kind: "ImageStreamTag"
             name: "peopleapi:latest"
+  - apiVersion: v1
+    kind: "DeploymentConfig"
+    metadata:
+      name: "peopleapidb-dc"
+      annotations:
+        description: "Handles deployment of the demo People API MSSQL Express Linux database"
+      generation: 2
+      labels:
+        app: peopleapi-template
+        application: peopleapi
+        createdBy: peopleapi-template
+      namespace: peopleapi
+    spec:
+      replicas: 1
+      selector:
+        name: peopleapidb
+      strategy:
+        activeDeadlineSeconds: 21600
+        recreateParams:
+          timeoutSeconds: 600
+        resources: {}
+        type: Recreate
+      template:
+        metadata:
+          labels:
+            name: "peopleapidb"
+        spec:
+          containers:
+            - name: peopleapidb
+              image: 'peopleapi/peopleapidb:latest'
+              imagePullPolicy: IfNotPresent
+              ports:
+                - containerPort: 1433
+                  protocol: TCP
+              resources: 
+                limits:
+                  cpu: 500m
+                  memory: 750Mi
+                requests:
+                  cpu: 250m
+                  memory: 250Mi
+              terminationMessagePath: /dev/termination-log
+              terminationMessagePolicy: File
+              volumeMounts:
+                - mountPath: /var/opt/mssql
+                  name: mssql-data
+          dnsPolicy: ClusterFirst
+          restartPolicy: Always
+          schedulerName: default-scheduler
+          securityContext: {}
+          terminationGracePeriodSeconds: 30
+          volumes:
+            - name: mssql-data
+              persistentVolumeClaim:
+                claimName: mssql-peopleapidb-data
+      test: false
+      triggers:
+      - type: "ConfigChange"
+      - type: "ImageChange"
+        imageChangeParams:
+          automatic: true
+          containerNames:
+          - "peopleapidb"
+          from:
+            kind: "ImageStreamTag"
+            name: "peopleapidb:latest"
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: mssql-peopleapidb-data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: ${MSSQL_VOLUME_CAPACITY}
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: jenkins-agent-base
+      labels:
+        role: jenkins-slave
+    data:
+      base: |-
+        <org.csanchez.jenkins.plugins.kubernetes.PodTemplate>
+          <inheritFrom></inheritFrom>
+          <name>base</name>
+          <instanceCap>2147483647</instanceCap>
+          <idleMinutes>0</idleMinutes>
+          <label>base</label>
+          <serviceAccount>jenkins</serviceAccount>
+          <nodeSelector></nodeSelector>
+          <volumes/>
+          <containers>
+            <org.csanchez.jenkins.plugins.kubernetes.ContainerTemplate>
+              <name>jnlp</name>
+              <image>docker.io/openshift/jenkins-slave-base-centos7</image>
+              <privileged>false</privileged>
+              <alwaysPullImage>false</alwaysPullImage>
+              <workingDir>/tmp</workingDir>
+              <command></command>
+              <args>${computer.jnlpmac} ${computer.name}</args>
+              <ttyEnabled>false</ttyEnabled>
+              <resourceRequestCpu></resourceRequestCpu>
+              <resourceRequestMemory></resourceRequestMemory>
+              <resourceLimitCpu></resourceLimitCpu>
+              <resourceLimitMemory></resourceLimitMemory>
+              <envVars/>
+            </org.csanchez.jenkins.plugins.kubernetes.ContainerTemplate>
+          </containers>
+          <envVars/>
+          <annotations/>
+          <imagePullSecrets/>
+          <nodeProperties/>
+        </org.csanchez.jenkins.plugins.kubernetes.PodTemplate>
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: jenkins-agent-dotnetcore21
+      labels:
+        role: jenkins-slave
+    data:
+      dotnetcore21: |-
+        <org.csanchez.jenkins.plugins.kubernetes.PodTemplate>
+          <inheritFrom></inheritFrom>
+          <name>dotnetcore21</name>
+          <instanceCap>2147483647</instanceCap>
+          <idleMinutes>0</idleMinutes>
+          <label>dotnetcore21</label>
+          <serviceAccount>jenkins</serviceAccount>
+          <nodeSelector></nodeSelector>
+          <volumes/>
+          <containers>
+            <org.csanchez.jenkins.plugins.kubernetes.ContainerTemplate>
+              <name>jnlp</name>
+              <image>registry.access.redhat.com/dotnet/dotnet-21-jenkins-slave-rhel7</image>
+              <privileged>false</privileged>
+              <alwaysPullImage>false</alwaysPullImage>
+              <workingDir>/tmp</workingDir>
+              <command></command>
+              <args>${computer.jnlpmac} ${computer.name}</args>
+              <ttyEnabled>false</ttyEnabled>
+              <resourceRequestCpu></resourceRequestCpu>
+              <resourceRequestMemory></resourceRequestMemory>
+              <resourceLimitCpu></resourceLimitCpu>
+              <resourceLimitMemory></resourceLimitMemory>
+              <envVars/>
+            </org.csanchez.jenkins.plugins.kubernetes.ContainerTemplate>
+          </containers>
+          <envVars/>
+          <annotations/>
+          <imagePullSecrets/>
+          <nodeProperties/>
+        </org.csanchez.jenkins.plugins.kubernetes.PodTemplate>
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: jenkins-agent-sonar-dotnet
+      labels:
+        role: jenkins-slave
+    data:
+      dotnetcore21: |-
+        <org.csanchez.jenkins.plugins.kubernetes.PodTemplate>
+          <inheritFrom></inheritFrom>
+          <name>sonar-dotnet</name>
+          <instanceCap>2147483647</instanceCap>
+          <idleMinutes>0</idleMinutes>
+          <label>sonar-dotnet</label>
+          <serviceAccount>jenkins</serviceAccount>
+          <nodeSelector></nodeSelector>
+          <volumes/>
+          <containers>
+            <org.csanchez.jenkins.plugins.kubernetes.ContainerTemplate>
+              <name>jnlp</name>
+              <image>172.30.1.1:5000/openshift/jenkins-slave-sonarqube-dotnet</image>
+              <privileged>false</privileged>
+              <alwaysPullImage>false</alwaysPullImage>
+              <workingDir>/tmp</workingDir>
+              <command></command>
+              <args>${computer.jnlpmac} ${computer.name}</args>
+              <ttyEnabled>false</ttyEnabled>
+              <resourceRequestCpu></resourceRequestCpu>
+              <resourceRequestMemory></resourceRequestMemory>
+              <resourceLimitCpu></resourceLimitCpu>
+              <resourceLimitMemory></resourceLimitMemory>
+              <envVars/>
+            </org.csanchez.jenkins.plugins.kubernetes.ContainerTemplate>
+          </containers>
+          <envVars/>
+          <annotations/>
+          <imagePullSecrets/>
+          <nodeProperties/>
+        </org.csanchez.jenkins.plugins.kubernetes.PodTemplate>
 parameters:
   - name: "CONSUMER_GIT_URL"
     displayName: "Source Repository URL"
@@ -166,5 +396,15 @@ parameters:
   - name: "CONSUMER_GIT_BRANCH"
     displayName: "Source Repository Branch"
     description: "The branch within the git repository with your application source code"
-    value: "master"
+    value: "develop"
     required: true
+  - name: "PEOPLEAPI_CONN_STRING"
+    displayName: "Connection String for PeopleAPI"
+    description: "The database connection string for the peopleapidb database for this API"
+    value: "server=peopleapidb; user id=peopleAPI; password=myP@ssw0rd; initial catalog=peopleAPI;"
+    required: true
+  - name: MSSQL_VOLUME_CAPACITY
+    description: Volume space available for MSSQL
+    displayName: MSSQL Volume Capacity
+    required: true
+    value: 1Gi
